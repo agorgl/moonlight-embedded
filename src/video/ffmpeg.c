@@ -36,6 +36,9 @@ static AVPacket* pkt;
 static const AVCodec* decoder;
 static AVCodecContext* decoder_ctx;
 static AVFrame** dec_frames;
+static AVBufferRef *hw_device_ctx = NULL;
+static enum AVPixelFormat hw_pix_fmt;
+static AVFrame *sw_frame;
 
 static int dec_frames_cnt;
 static int current_frame, next_frame;
@@ -43,6 +46,52 @@ static int current_frame, next_frame;
 enum decoders ffmpeg_decoder;
 
 #define BYTES_PER_PIXEL 4
+
+static enum AVPixelFormat get_hw_format(AVCodecContext *ctx, const enum AVPixelFormat *pix_fmts) {
+  const enum AVPixelFormat *p;
+  for (p = pix_fmts; *p != -1; p++) {
+    if (*p == hw_pix_fmt)
+      return *p;
+  }
+
+  fprintf(stderr, "Failed to get HW surface format.\n");
+  return AV_PIX_FMT_NONE;
+}
+
+static bool hwaccel_setup(const AVCodec* decoder) {
+  enum AVHWDeviceType type = AV_HWDEVICE_TYPE_NONE;
+
+  for (int i = 0;; i++) {
+    const AVCodecHWConfig *config = avcodec_get_hw_config(decoder, i);
+    if (!config)
+      break;
+
+    if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) {
+      fprintf(stderr, "Using hwaccel type %s\n", av_hwdevice_get_type_name(config->device_type));
+      type = config->device_type;
+      hw_pix_fmt = config->pix_fmt;
+
+      int err = av_hwdevice_ctx_create(&hw_device_ctx, type, NULL, NULL, 0);
+      if (err < 0) {
+        fprintf(stderr, "Failed to create specified HW device.\n");
+        hw_pix_fmt = AV_PIX_FMT_NONE;
+        type = AV_HWDEVICE_TYPE_NONE;
+        continue;
+      }
+
+      decoder_ctx->get_format = get_hw_format;
+      decoder_ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
+      break;
+    }
+  }
+
+  if (type == AV_HWDEVICE_TYPE_NONE) {
+    fprintf(stderr, "Decoder %s does not support any of the available hwaccel methods\n", decoder->name);
+    return false;
+  }
+
+  return true;
+}
 
 // This function must be called before
 // any other decoding functions
@@ -61,7 +110,7 @@ int ffmpeg_init(int videoFormat, int width, int height, int perf_lvl, int buffer
 
   ffmpeg_decoder = perf_lvl & VAAPI_ACCELERATION ? VAAPI : SOFTWARE;
 
-  for (int try = 0; try < 6; try++) {
+  for (int try = 0; try < 5; try++) {
     if (videoFormat & VIDEO_FORMAT_MASK_H264) {
       if (ffmpeg_decoder == SOFTWARE) {
         if (try == 0) decoder = avcodec_find_decoder_by_name("h264_nvv4l2"); // Tegra
@@ -92,6 +141,7 @@ int ffmpeg_init(int videoFormat, int width, int height, int perf_lvl, int buffer
     if (!decoder) {
       continue;
     }
+    fprintf(stderr, "Trying decoder %s\n", decoder->name);
 
     decoder_ctx = avcodec_alloc_context3(decoder);
     if (decoder_ctx == NULL) {
@@ -118,7 +168,18 @@ int ffmpeg_init(int videoFormat, int width, int height, int perf_lvl, int buffer
 
     decoder_ctx->width = width;
     decoder_ctx->height = height;
-    decoder_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+
+    // Configure hardware decoding if supported
+    bool hwaccel = false;
+    if (avcodec_get_hw_config(decoder, 0)) {
+      if (hwaccel_setup(decoder)) {
+        hwaccel = true;
+      }
+    }
+
+    if (!hwaccel) {
+      decoder_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    }
 
     int err = avcodec_open2(decoder_ctx, decoder, NULL);
     if (err < 0) {
@@ -133,7 +194,7 @@ int ffmpeg_init(int videoFormat, int width, int height, int perf_lvl, int buffer
     return -1;
   }
 
-  printf("Using FFmpeg decoder: %s\n", decoder->name);
+  fprintf(stderr, "Using FFmpeg decoder: %s\n", decoder->name);
 
   dec_frames_cnt = buffer_count;
   dec_frames = malloc(buffer_count * sizeof(AVFrame*));
@@ -149,6 +210,9 @@ int ffmpeg_init(int videoFormat, int width, int height, int perf_lvl, int buffer
       return -1;
     }
   }
+  if (hw_device_ctx) {
+    sw_frame = av_frame_alloc();
+  }
 
   #ifdef HAVE_VAAPI
   if (ffmpeg_decoder == VAAPI)
@@ -161,6 +225,12 @@ int ffmpeg_init(int videoFormat, int width, int height, int perf_lvl, int buffer
 // This function must be called after
 // decoding is finished
 void ffmpeg_destroy(void) {
+  if (sw_frame) {
+    av_frame_free(&sw_frame);
+  }
+  if (hw_device_ctx) {
+    av_buffer_unref(&hw_device_ctx);
+  }
   av_packet_free(&pkt);
   if (decoder_ctx) {
     avcodec_free_context(&decoder_ctx);
@@ -174,13 +244,26 @@ void ffmpeg_destroy(void) {
 }
 
 AVFrame* ffmpeg_get_frame(bool native_frame) {
-  int err = avcodec_receive_frame(decoder_ctx, dec_frames[next_frame]);
+  AVFrame *frame = dec_frames[next_frame];
+  int err = avcodec_receive_frame(decoder_ctx, frame);
   if (err == 0) {
     current_frame = next_frame;
     next_frame = (current_frame+1) % dec_frames_cnt;
 
-    if (ffmpeg_decoder == SOFTWARE || native_frame)
-      return dec_frames[current_frame];
+    if (ffmpeg_decoder == SOFTWARE || native_frame) {
+      AVFrame *tmp_frame = NULL;
+      if (frame->format == hw_pix_fmt) {
+        /* retrieve data from GPU to CPU */
+        if (av_hwframe_transfer_data(sw_frame, frame, 0) < 0) {
+          fprintf(stderr, "Error transferring the data to system memory\n");
+          return NULL;
+        }
+        tmp_frame = sw_frame;
+      } else {
+        tmp_frame = frame;
+      }
+      return tmp_frame;
+    }
   } else if (err != AVERROR(EAGAIN)) {
     char errorstring[512];
     av_strerror(err, errorstring, sizeof(errorstring));
